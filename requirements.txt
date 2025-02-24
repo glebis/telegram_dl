@@ -1,0 +1,4 @@
+telethon>=1.34.0
+rich>=13.7.0  # For beautiful terminal interface
+typer>=0.9.0  # For CLI interface
+python-dotenv>=1.0.0  # For environment variable management
