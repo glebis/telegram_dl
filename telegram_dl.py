@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import json
 import time
@@ -24,6 +26,12 @@ from config import (
 
 app = typer.Typer()
 console = Console()
+DEBUG = False
+
+def debug_print(message: str) -> None:
+    """Print debug message if DEBUG mode is enabled."""
+    if DEBUG:
+        console.print(f"[yellow]Debug: {message}[/yellow]")
 
 async def ensure_client() -> TelegramClient:
     """Ensure we have a configured client."""
@@ -44,14 +52,35 @@ def sanitize_filename(name: str) -> str:
 
 async def get_all_chats(client: TelegramClient, search_term: Optional[str] = None) -> List[Dialog]:
     """Get all chats, optionally filtered by search term."""
-    chats = await client.get_dialogs()
+    # Get current user info
+    me = await client.get_me()
+    debug_print(f"Current user ID: {me.id}")
+    
+    # Get all dialogs
+    all_dialogs = await client.get_dialogs()
+    debug_print(f"Total dialogs found: {len(all_dialogs)}")
+    
+    # Find Saved Messages
+    saved_messages = []
+    for dialog in all_dialogs:
+        if isinstance(dialog.entity, User) and dialog.entity.is_self:
+            saved_messages = [dialog]
+            debug_print("Found Saved Messages!")
+            break
+    
+    # Filter out Saved Messages from regular chats to avoid duplication
+    chats = [chat for chat in all_dialogs if not (isinstance(chat.entity, User) and chat.entity.is_self)]
+    
+    # Combine lists with Saved Messages first
+    all_chats = saved_messages + chats
+    
     if search_term:
         search_term = search_term.lower()
-        chats = [
-            chat for chat in chats
+        all_chats = [
+            chat for chat in all_chats
             if search_term in chat.name.lower()
         ]
-    return sorted(chats, key=lambda x: x.date, reverse=True)
+    return all_chats
 
 def display_chats(chats: List[Dialog], selected_indices: Optional[List[int]] = None) -> Table:
     """Display chats in a rich table."""
@@ -63,18 +92,25 @@ def display_chats(chats: List[Dialog], selected_indices: Optional[List[int]] = N
     table.add_column("Last Message", style="dim")
 
     for idx, chat in enumerate(chats, 1):
-        chat_type = (
-            "Private" if isinstance(chat.entity, User) else
-            "Group" if isinstance(chat.entity, Chat) else
-            "Channel" if isinstance(chat.entity, Channel) else
-            "Unknown"
-        )
+        # Special handling for Saved Messages
+        if isinstance(chat.entity, User) and chat.entity.is_self:
+            chat_type = "Saved Messages"
+            chat_name = "📑 Saved Messages"
+        else:
+            chat_type = (
+                "Private" if isinstance(chat.entity, User) else
+                "Group" if isinstance(chat.entity, Chat) else
+                "Channel" if isinstance(chat.entity, Channel) else
+                "Unknown"
+            )
+            chat_name = chat.name
+
         last_msg_date = chat.date.strftime("%Y-%m-%d %H:%M")
         selected = "✓" if selected_indices and (idx-1) in selected_indices else " "
         table.add_row(
             str(idx),
             selected,
-            chat.name,
+            chat_name,
             chat_type,
             last_msg_date
         )
@@ -277,6 +313,12 @@ async def export_chat(client: TelegramClient, chat: Dialog, format: str, limit: 
     
     console.print(f"Chat exported to [bold green]{filename}[/bold green]")
 
+@app.callback()
+def main(debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output")):
+    """Telegram chat history export tool with rate limiting and error handling."""
+    global DEBUG
+    DEBUG = debug
+
 @app.command()
 def list(
     search: str = typer.Option(None, "--search", "-s", help="Search term to filter chats"),
@@ -335,27 +377,53 @@ def export(
     format: str = typer.Option(None, "--format", "-f", help="Export format: 'json' or 'md' (markdown)"),
     interactive: bool = typer.Option(True, "--interactive/--no-interactive", "-i/-n", help="Use interactive chat selection (default: true)"),
     limit: int = typer.Option(100, "--limit", "-l", help="Maximum number of messages per chat (default: 100)"),
-    include_usernames: bool = typer.Option(True, "--usernames/--no-usernames", "-u/-nu", help="Include username information in export (default: true)")
+    include_usernames: bool = typer.Option(True, "--usernames/--no-usernames", "-u/-nu", help="Include username information in export (default: true)"),
+    saved_messages: bool = typer.Option(False, "--saved-messages", "-s", help="Export only Saved Messages")
 ):
     """Export chat history with rate limiting and error handling.
     
     Downloads messages with automatic rate limiting (1 msg/sec) and username resolution.
     Handles rate limit errors (429) automatically with smart retrying.
     Exports are saved to the 'exports' directory with date-prefixed filenames.
+    Use --saved-messages flag to export only Saved Messages.
     """
     async def _export():
         client = await ensure_client()
-        chats = await get_all_chats(client)
-
-        if interactive:
-            selected_indices = interactive_select_chats(chats)
-            if not selected_indices:
-                console.print("No chats selected for export")
+        debug_print("Starting export process...")
+        
+        if saved_messages:
+            debug_print("Looking for Saved Messages...")
+            # Get all dialogs and find Saved Messages
+            all_dialogs = await client.get_dialogs()
+            debug_print(f"Found {len(all_dialogs)} total dialogs")
+            
+            saved_dialog = None
+            for dialog in all_dialogs:
+                if isinstance(dialog.entity, User) and dialog.entity.is_self:
+                    saved_dialog = dialog
+                    debug_print("Found Saved Messages dialog!")
+                    break
+            
+            if not saved_dialog:
+                console.print("[red]Could not find Saved Messages[/red]")
                 await client.disconnect()
                 return
+            
+            debug_print(f"Saved Messages name: {saved_dialog.name}")
+            chats = [saved_dialog]
+            selected_indices = [0]
+            interactive = False  # Override interactive mode when using --saved-messages
         else:
-            # If not interactive, export all chats
-            selected_indices = list(range(len(chats)))
+            chats = await get_all_chats(client)
+            if interactive:
+                selected_indices = interactive_select_chats(chats)
+                if not selected_indices:
+                    console.print("No chats selected for export")
+                    await client.disconnect()
+                    return
+            else:
+                # If not interactive, export all chats
+                selected_indices = list(range(len(chats)))
 
         # If format is not specified, ask for it
         export_format = format
@@ -366,6 +434,7 @@ def export(
                 default="json"
             )
 
+        debug_print(f"Starting export of {len(selected_indices)} chats")
         for idx in selected_indices:
             chat = chats[idx]
             console.print(f"\nExporting chat: [bold]{chat.name}[/bold] (limit: {limit} messages, usernames: {include_usernames})")
